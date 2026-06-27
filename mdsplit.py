@@ -32,7 +32,6 @@ from collections import namedtuple
 from dataclasses import dataclass
 from pathlib import Path
 import argparse
-import io
 import os
 import re
 import sys
@@ -104,18 +103,18 @@ class Splitter(ABC):
         pass
 
     def process_stream(self, in_stream, fallback_out_file_name, out_path):
+        self._process_stream_with_heading_map(in_stream, fallback_out_file_name, out_path, {})
+
+    def _process_stream_with_heading_map(self, in_stream, fallback_out_file_name, out_path, heading_map):
+        """
+        Process a stream, optionally adapting cross-references using the provided heading_map.
+        """
         if self.verbose:
             print(f"Create output folder '{out_path}'")
 
-        if self.adapt_crossrefs:
-            heading_map, new_stream = self._get_heading_map(in_stream, fallback_out_file_name, out_path)
-        else:
-            heading_map = {}
-            new_stream = in_stream
-
         toc = "# Table of Contents\n"
         self.stats.in_files += 1
-        chapters = split_by_heading(new_stream, self.level)
+        chapters = split_by_heading(in_stream, self.level)
         nav_chapter_path2title = {}
 
         for chapter in chapters:
@@ -171,16 +170,13 @@ class Splitter(ABC):
             return filename[:-3]
         return filename
 
-    def _get_heading_map(self, in_stream, fallback_out_file_name, out_path):
+    def _build_heading_map(self, in_stream, fallback_out_file_name, out_path):
         """
-        Collect all headings for anchor mapping and return new stream for second pass
+        Build heading map from a stream (first pass for cross-reference adaptation).
+        Consumes the stream.
         """
-        # Two passes required: buffer content to allow for a second iteration later
-        content = in_stream.read()
-
         heading_map = {}
-        lines = content.splitlines(keepends=True)
-        chapters = split_by_heading(lines, self.level)
+        chapters = split_by_heading(in_stream, self.level)
         for chapter in chapters:
             if not chapter.heading:
                 continue
@@ -195,7 +191,7 @@ class Splitter(ABC):
         if self.verbose:
             print(f"Collected {len(heading_map)} heading anchors")
 
-        return heading_map, io.StringIO(content)
+        return heading_map
 
     @staticmethod
     def _get_chapter_path(chapter, out_path, fallback_filename=None):
@@ -310,6 +306,8 @@ class StdinSplitter(Splitter):
     """Split content from stdin"""
 
     def __init__(self, encoding, level, toc, navigation, adapt_crossrefs, out_path, force, verbose):
+        if adapt_crossrefs:
+            raise MdSplitError("--adapt-crossrefs is not supported for stdin input. Use file input instead.")
         super().__init__(encoding, level, toc, navigation, adapt_crossrefs, force, verbose)
         self.out_path = Path(DIR_SUFFIX) if out_path is None else Path(out_path)
         if self.out_path.exists():
@@ -367,8 +365,15 @@ class PathBasedSplitter(Splitter):
     def process_file(self, in_file_path, out_path):
         if self.verbose:
             print(f"Process file '{in_file_path}' to '{out_path}'")
-        with open(in_file_path, encoding=self.encoding) as stream:
-            self.process_stream(stream, in_file_path.name, out_path)
+        if self.adapt_crossrefs:
+            # Two passes: first to collect all headings, second for content processing
+            with open(in_file_path, encoding=self.encoding) as stream:
+                heading_map = self._build_heading_map(stream, in_file_path.name, out_path)
+            with open(in_file_path, encoding=self.encoding) as stream:
+                self._process_stream_with_heading_map(stream, in_file_path.name, out_path, heading_map)
+        else:
+            with open(in_file_path, encoding=self.encoding) as stream:
+                self.process_stream(stream, in_file_path.name, out_path)
 
     def print_stats(self):
         print("Splittig result:")
