@@ -102,20 +102,24 @@ class Splitter(ABC):
         pass
 
     def process_stream(self, in_stream, fallback_out_file_name, out_path):
-        if self.adapt_crossrefs:
-            return self._process_stream_with_adaptation(in_stream, fallback_out_file_name, out_path)
-        else:
-            # Original processing - unchanged for backwards compatibility
-            return self._process_stream_original(in_stream, fallback_out_file_name, out_path)
-    
-    def _process_stream_original(self, in_stream, fallback_out_file_name, out_path):
-        """Original process_stream implementation without cross-reference adaptation."""
         if self.verbose:
             print(f"Create output folder '{out_path}'")
 
+        # If cross-reference adaptation is enabled, do a first pass to collect headings
+        heading_map = {}
+        if self.adapt_crossrefs:
+            heading_map, content = self._collect_metadata(in_stream, fallback_out_file_name, out_path)
+            if self.verbose:
+                print(f"Collected {len(heading_map)} heading anchors")
+            # Create a new stream from the content
+            content_stream = io.StringIO(content)
+            chapters_stream = content_stream
+        else:
+            chapters_stream = in_stream
+
         toc = "# Table of Contents\n"
         self.stats.in_files += 1
-        chapters = split_by_heading(in_stream, self.level)
+        chapters = split_by_heading(chapters_stream, self.level)
         nav_chapter_path2title = {}
 
         for chapter in chapters:
@@ -148,9 +152,9 @@ class Splitter(ABC):
                 if self.toc:
                     indent = len(chapter.parent_headings) * "  "
                     toc += f"\n{indent}- [{title}](<./{chapter_path.relative_to(out_path)}>)"
-            with open(chapter_path, mode="a", encoding=self.encoding) as file:
-                for line in chapter.text:
-                    file.write(line)
+            
+            # Write chapter content with optional transformations
+            self._write_chapter_content(chapter, chapter_path, heading_map)
 
         if self.navigation:
             nav_chapter_paths = list(nav_chapter_path2title)
@@ -289,96 +293,27 @@ class Splitter(ABC):
         new_line = INLINE_LINK_PATTERN.sub(transform_inline_link, line)
         return new_line
 
-    def _process_stream_with_adaptation(self, in_stream, fallback_out_file_name, out_path):
+    def _write_chapter_content(self, chapter, chapter_path, heading_map):
         """
-        Process stream with cross-reference adaptation using two-pass approach.
+        Write chapter content to file, optionally transforming lines for cross-reference adaptation.
         """
-        if self.verbose:
-            print(f"Create output folder '{out_path}'")
-
-        # Pass 1: Collect metadata (headings)
-        heading_map, content = self._collect_metadata(in_stream, fallback_out_file_name, out_path)
-        
-        if self.verbose:
-            print(f"Collected {len(heading_map)} heading anchors")
-
-        # Create a new stream from the content
-        content_stream = io.StringIO(content)
-        
-        toc = "# Table of Contents\n"
-        self.stats.in_files += 1
-        chapters = split_by_heading(content_stream, self.level)
-        nav_chapter_path2title = {}
-
-        for chapter in chapters:
-            self.stats.chapters += 1
-            chapter_dir = out_path
-            for parent in chapter.parent_headings:
-                chapter_dir = chapter_dir / get_valid_filename(parent)
-            chapter_dir.mkdir(parents=True, exist_ok=True)
-
-            chapter_filename = (
-                fallback_out_file_name
-                if chapter.heading is None
-                else get_valid_filename(chapter.heading.heading_title) + ".md"
-            )
-            chapter_path = chapter_dir / chapter_filename
-
-            if self.verbose:
-                print(f"Write {len(chapter.text)} lines to '{chapter_path}'")
-            if not chapter_path.exists():
-                # the first time a chapter file is written
-                # (can happen multiple times for duplicate headings)
-                self.stats.new_out_files += 1
-                title = (
-                    Splitter.remove_md_suffix(fallback_out_file_name)
-                    if chapter.heading is None
-                    else chapter.heading.heading_title
-                )
-                if self.navigation:
-                    nav_chapter_path2title[chapter_path.relative_to(out_path)] = title
-                if self.toc:
-                    indent = len(chapter.parent_headings) * "  "
-                    toc += f"\n{indent}- [{title}](<./{chapter_path.relative_to(out_path)}>)"
-            
-            # Write chapter content with transformations
-            within_fence = False
-            with open(chapter_path, mode="a", encoding=self.encoding) as file:
-                for line in chapter.text:
-                    # Track fence state
-                    if line.startswith(tuple(FENCES)):
-                        within_fence = not within_fence
-                    
-                    if within_fence:
-                        # Write line unchanged - NO transformations
-                        file.write(line)
-                    else:
-                        # Transform the line
-                        transformed_line = self._transform_line(line, heading_map, chapter_path)
-                        file.write(transformed_line)
-
-        if self.navigation:
-            nav_chapter_paths = list(nav_chapter_path2title)
-            for i, chapter_path in enumerate(nav_chapter_paths):
-                with open(out_path / chapter_path, mode="a", encoding=self.encoding) as file:
-                    nav = []
-                    if self.toc:
-                        nav.append(f"[🡅](./toc.md)")
-                    if i > 0:
-                        prev_path = nav_chapter_paths[i - 1]
-                        nav.append(f"[🡄 {nav_chapter_path2title[prev_path]}](./{prev_path})")
-                    if i < len(nav_chapter_path2title) - 1:
-                        next_path = nav_chapter_paths[i + 1]
-                        nav.append(f"[{nav_chapter_path2title[next_path]} 🡆](./{next_path})")
-                    file.write("\n\n---\n\n")
-                    file.write(" ·•⦁•· ".join(nav))
-
-        if self.toc:
-            self.stats.new_out_files += 1
-            with open(out_path / "toc.md", mode="w", encoding=self.encoding) as file:
-                if self.verbose:
-                    print(f"Write table of contents to {out_path / 'toc.md'}")
-                file.write(toc)
+        within_fence = False
+        with open(chapter_path, mode="a", encoding=self.encoding) as file:
+            for line in chapter.text:
+                # Track fence state
+                if line.startswith(tuple(FENCES)):
+                    within_fence = not within_fence
+                
+                if within_fence:
+                    # Write line unchanged - NO transformations
+                    file.write(line)
+                elif heading_map:
+                    # Transform the line for cross-reference adaptation
+                    transformed_line = self._transform_line(line, heading_map, chapter_path)
+                    file.write(transformed_line)
+                else:
+                    # No transformation needed
+                    file.write(line)
 
 
 class StdinSplitter(Splitter):
