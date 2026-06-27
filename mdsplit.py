@@ -32,6 +32,7 @@ from collections import namedtuple
 from dataclasses import dataclass
 from pathlib import Path
 import argparse
+import io
 import os
 import re
 import sys
@@ -43,12 +44,51 @@ DIR_SUFFIX = "_split"
 Chapter = namedtuple("Chapter", "parent_headings, heading, text")
 
 
+def normalize_anchor(text: str) -> str:
+    """
+    Convert heading text to GitHub-style anchor ID.
+    - Lowercase
+    - Replace spaces with -
+    - Remove special chars (except - and _)
+    - Strip leading/trailing non-alphanumeric
+    """
+    if not text:
+        return ""
+    anchor = text.lower()
+    anchor = re.sub(r'[^\w\- ]', '', anchor)  # Remove special chars
+    anchor = re.sub(r'[\s]+', '-', anchor)   # Replace whitespace with -
+    anchor = anchor.strip('-_')               # Trim non-alphanumeric from ends
+    return anchor
+
+
+def is_same_file(file_part: str, current_file: Path) -> bool:
+    """Check if file_part refers to the current file or is empty."""
+    if not file_part or file_part == '':
+        return True
+    if file_part.startswith('./') or file_part.startswith('/'):
+        return False
+    if file_part.endswith('.md') or file_part.endswith('.markdown'):
+        return False
+    # If it's just a fragment (no file part), consider it same file
+    return True
+
+
+# Patterns for link processing
+# Fixed regex pattern - need to escape the angle brackets properly
+INLINE_LINK_PATTERN = re.compile(r'\[([^\]]+)\]\(\s*(?:<([^>]+)>|([^\s)]+))\s*(?:"([^"]*)")?\s*\)')
+ANCHOR_ONLY_PATTERN = re.compile(r'^#.+$')
+REF_DEFINITION_PATTERN = re.compile(r'^\s*\[([^\]]+)\]\s*:\s*(.+)$')
+FOOTNOTE_REF_PATTERN = re.compile(r'\[\^([^\]]+)\]')
+FOOTNOTE_DEF_PATTERN = re.compile(r'^\s*\[\^([^\]]+)\]\s*:\s*(.+)$')
+
+
 class Splitter(ABC):
-    def __init__(self, encoding, level, toc, navigation, force, verbose):
+    def __init__(self, encoding, level, toc, navigation, adapt_crossrefs, force, verbose):
         self.encoding = encoding
         self.level = level
         self.toc = toc
         self.navigation = navigation
+        self.adapt_crossrefs = adapt_crossrefs
         self.force = force
         self.verbose = verbose
         self.stats = Stats()
@@ -62,6 +102,14 @@ class Splitter(ABC):
         pass
 
     def process_stream(self, in_stream, fallback_out_file_name, out_path):
+        if self.adapt_crossrefs:
+            return self._process_stream_with_adaptation(in_stream, fallback_out_file_name, out_path)
+        else:
+            # Original processing - unchanged for backwards compatibility
+            return self._process_stream_original(in_stream, fallback_out_file_name, out_path)
+    
+    def _process_stream_original(self, in_stream, fallback_out_file_name, out_path):
+        """Original process_stream implementation without cross-reference adaptation."""
         if self.verbose:
             print(f"Create output folder '{out_path}'")
 
@@ -133,12 +181,205 @@ class Splitter(ABC):
             return filename[:-3]
         return filename
 
+    def _collect_metadata(self, in_stream, fallback_out_file_name, out_path):
+        """
+        Pass 1: Collect all headings for anchor mapping.
+        Returns heading_map: {normalized_heading: (relative_path, anchor_id)}
+        """
+        heading_map = {}
+        
+        # First, we need to split the content to know where headings go
+        # But we can't consume the stream, so we'll read it into memory
+        content = in_stream.read()
+        if isinstance(content, bytes):
+            content = content.decode(self.encoding or 'utf-8')
+        
+        # Split by lines and process
+        lines = content.splitlines(keepends=True)
+        
+        # We'll simulate the splitting process to build heading map
+        chapters = split_by_heading(lines, self.level)
+        
+        for chapter in chapters:
+            if chapter.heading:
+                normalized = normalize_anchor(chapter.heading.heading_title)
+                # Calculate the chapter path
+                chapter_dir = out_path
+                for parent in chapter.parent_headings:
+                    chapter_dir = chapter_dir / get_valid_filename(parent)
+                
+                chapter_filename = get_valid_filename(chapter.heading.heading_title) + ".md"
+                chapter_path = chapter_dir / chapter_filename
+                relative_path = chapter_path.relative_to(out_path)
+                
+                # First occurrence wins for duplicates
+                if normalized not in heading_map:
+                    heading_map[normalized] = (relative_path, normalized)
+        
+        # Rewind the stream by creating a new StringIO with the content
+        # We need to return both the heading_map and the content for re-processing
+        return heading_map, content
+
+    def _transform_line(self, line, heading_map, current_file):
+        """
+        Transform a single line, adapting anchor links using the heading_map.
+        """
+        # Skip transformation if within code fence
+        if line.startswith(tuple(FENCES)):
+            return line
+            
+        # Process inline links
+        def transform_inline_link(match):
+            text = match.group(1)
+            # Group 2 is from angle brackets <url>, Group 3 is from normal (url)
+            url = match.group(2) or match.group(3)
+            title = match.group(4) or ''
+            
+            if not url or '#' not in url:
+                # No anchor, external or file-only link
+                return match.group(0)
+            
+            # Split URL into file and anchor parts
+            if url.startswith('#'):
+                # Anchor-only link
+                anchor = url[1:]
+                file_part = None
+            else:
+                # Could be file.md#anchor or #anchor or /path#anchor
+                parts = url.split('#', 1)
+                file_part = parts[0]
+                anchor = parts[1]
+            
+            # Normalize anchor for lookup
+            normalized_anchor = normalize_anchor(anchor)
+            
+            # Check if this is an internal anchor link (no file part or same file)
+            if file_part is None or file_part == '' or is_same_file(file_part, current_file):
+                # This is an internal anchor link
+                if normalized_anchor in heading_map:
+                    target_file, target_anchor = heading_map[normalized_anchor]
+                    # Calculate relative path from current_file to target_file
+                    # current_file is an absolute path, target_file is relative to out_path
+                    current_path = Path(current_file)
+                    out_path = current_path.parent  # Get the output directory
+                    target_path = out_path / target_file
+                    
+                    # Calculate relative path from current file's directory to target file
+                    if current_path.parent == target_path.parent:
+                        relative_path = target_path.name
+                    else:
+                        # Calculate relative path from current file's directory to target
+                        relative_path = target_path.relative_to(current_path.parent)
+                    
+                    new_url = f"./{relative_path}#{target_anchor}"
+                    if title:
+                        return f"[{text}]({new_url} \"{title}\")"
+                    return f"[{text}]({new_url})"
+            
+            # External link or can't resolve - return original
+            return match.group(0)
+        
+        # Apply transformation to the line
+        new_line = INLINE_LINK_PATTERN.sub(transform_inline_link, line)
+        return new_line
+
+    def _process_stream_with_adaptation(self, in_stream, fallback_out_file_name, out_path):
+        """
+        Process stream with cross-reference adaptation using two-pass approach.
+        """
+        if self.verbose:
+            print(f"Create output folder '{out_path}'")
+
+        # Pass 1: Collect metadata (headings)
+        heading_map, content = self._collect_metadata(in_stream, fallback_out_file_name, out_path)
+        
+        if self.verbose:
+            print(f"Collected {len(heading_map)} heading anchors")
+
+        # Create a new stream from the content
+        content_stream = io.StringIO(content)
+        
+        toc = "# Table of Contents\n"
+        self.stats.in_files += 1
+        chapters = split_by_heading(content_stream, self.level)
+        nav_chapter_path2title = {}
+
+        for chapter in chapters:
+            self.stats.chapters += 1
+            chapter_dir = out_path
+            for parent in chapter.parent_headings:
+                chapter_dir = chapter_dir / get_valid_filename(parent)
+            chapter_dir.mkdir(parents=True, exist_ok=True)
+
+            chapter_filename = (
+                fallback_out_file_name
+                if chapter.heading is None
+                else get_valid_filename(chapter.heading.heading_title) + ".md"
+            )
+            chapter_path = chapter_dir / chapter_filename
+
+            if self.verbose:
+                print(f"Write {len(chapter.text)} lines to '{chapter_path}'")
+            if not chapter_path.exists():
+                # the first time a chapter file is written
+                # (can happen multiple times for duplicate headings)
+                self.stats.new_out_files += 1
+                title = (
+                    Splitter.remove_md_suffix(fallback_out_file_name)
+                    if chapter.heading is None
+                    else chapter.heading.heading_title
+                )
+                if self.navigation:
+                    nav_chapter_path2title[chapter_path.relative_to(out_path)] = title
+                if self.toc:
+                    indent = len(chapter.parent_headings) * "  "
+                    toc += f"\n{indent}- [{title}](<./{chapter_path.relative_to(out_path)}>)"
+            
+            # Write chapter content with transformations
+            within_fence = False
+            with open(chapter_path, mode="a", encoding=self.encoding) as file:
+                for line in chapter.text:
+                    # Track fence state
+                    if line.startswith(tuple(FENCES)):
+                        within_fence = not within_fence
+                    
+                    if within_fence:
+                        # Write line unchanged - NO transformations
+                        file.write(line)
+                    else:
+                        # Transform the line
+                        transformed_line = self._transform_line(line, heading_map, chapter_path)
+                        file.write(transformed_line)
+
+        if self.navigation:
+            nav_chapter_paths = list(nav_chapter_path2title)
+            for i, chapter_path in enumerate(nav_chapter_paths):
+                with open(out_path / chapter_path, mode="a", encoding=self.encoding) as file:
+                    nav = []
+                    if self.toc:
+                        nav.append(f"[🡅](./toc.md)")
+                    if i > 0:
+                        prev_path = nav_chapter_paths[i - 1]
+                        nav.append(f"[🡄 {nav_chapter_path2title[prev_path]}](./{prev_path})")
+                    if i < len(nav_chapter_path2title) - 1:
+                        next_path = nav_chapter_paths[i + 1]
+                        nav.append(f"[{nav_chapter_path2title[next_path]} 🡆](./{next_path})")
+                    file.write("\n\n---\n\n")
+                    file.write(" ·•⦁•· ".join(nav))
+
+        if self.toc:
+            self.stats.new_out_files += 1
+            with open(out_path / "toc.md", mode="w", encoding=self.encoding) as file:
+                if self.verbose:
+                    print(f"Write table of contents to {out_path / 'toc.md'}")
+                file.write(toc)
+
 
 class StdinSplitter(Splitter):
     """Split content from stdin"""
 
-    def __init__(self, encoding, level, toc, navigation, out_path, force, verbose):
-        super().__init__(encoding, level, toc, navigation, force, verbose)
+    def __init__(self, encoding, level, toc, navigation, adapt_crossrefs, out_path, force, verbose):
+        super().__init__(encoding, level, toc, navigation, adapt_crossrefs, force, verbose)
         self.out_path = Path(DIR_SUFFIX) if out_path is None else Path(out_path)
         if self.out_path.exists():
             if self.force:
@@ -158,8 +399,8 @@ class StdinSplitter(Splitter):
 class PathBasedSplitter(Splitter):
     """Split a specific file or all .md files found in a directory (recursively)"""
 
-    def __init__(self, in_path, encoding, level, toc, navigation, out_path, force, verbose):
-        super().__init__(encoding, level, toc, navigation, force, verbose)
+    def __init__(self, in_path, encoding, level, toc, navigation, adapt_crossrefs, out_path, force, verbose):
+        super().__init__(encoding, level, toc, navigation, adapt_crossrefs, force, verbose)
         self.in_path = Path(in_path)
         if not self.in_path.exists():
             raise MdSplitError(f"Input file/directory '{self.in_path}' does not exist. Exiting..")
@@ -352,6 +593,12 @@ def main():
         help="add a navigation footer on each page (links to toc, previous page, next page)",
     )
     parser.add_argument(
+        "-a",
+        "--adapt-crossrefs",
+        action="store_true",
+        help="adapt internal links to work across split files",
+    )
+    parser.add_argument(
         "-o", "--output", default=None, help="path to output folder (must not exist)"
     )
     parser.add_argument(
@@ -369,6 +616,7 @@ def main():
             "level": args.max_level,
             "toc": args.table_of_contents,
             "navigation": args.navigation,
+            "adapt_crossrefs": args.adapt_crossrefs,
             "out_path": args.output,
             "force": args.force,
             "verbose": args.verbose,
