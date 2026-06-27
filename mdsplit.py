@@ -264,14 +264,20 @@ class Splitter(ABC):
                     out_path = current_path.parent  # Get the output directory
                     target_path = out_path / target_file
                     
-                    # Calculate relative path from current file's directory to target file
-                    if current_path.parent == target_path.parent:
-                        relative_path = target_path.name
+                    # Check if the target is the same file as the current file
+                    if current_path.name == target_path.name and current_path.parent == target_path.parent:
+                        # Same file - only use the anchor
+                        new_url = f"#{target_anchor}"
                     else:
-                        # Calculate relative path from current file's directory to target
-                        relative_path = target_path.relative_to(current_path.parent)
+                        # Different file - calculate relative path
+                        if current_path.parent == target_path.parent:
+                            relative_path = target_path.name
+                        else:
+                            # Calculate relative path from current file's directory to target
+                            relative_path = target_path.relative_to(current_path.parent)
+                        
+                        new_url = f"./{relative_path}#{target_anchor}"
                     
-                    new_url = f"./{relative_path}#{target_anchor}"
                     if title:
                         return f"[{text}]({new_url} \"{title}\")"
                     return f"[{text}]({new_url})"
