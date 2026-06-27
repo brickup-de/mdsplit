@@ -62,7 +62,9 @@ def normalize_anchor(text: str) -> str:
 
 
 def is_same_file(file_part: str, current_file: Path) -> bool:
-    """Check if file_part refers to the current file or is empty."""
+    """
+    Check if file_part refers to the current file or is empty.
+    """
     if not file_part or file_part == '':
         return True
     if file_part.startswith('./') or file_part.startswith('/'):
@@ -105,36 +107,21 @@ class Splitter(ABC):
         if self.verbose:
             print(f"Create output folder '{out_path}'")
 
-        # If cross-reference adaptation is enabled, do a first pass to collect headings
-        heading_map = {}
         if self.adapt_crossrefs:
-            heading_map, content = self._collect_metadata(in_stream, fallback_out_file_name, out_path)
-            if self.verbose:
-                print(f"Collected {len(heading_map)} heading anchors")
-            # Create a new stream from the content
-            content_stream = io.StringIO(content)
-            chapters_stream = content_stream
+            heading_map, new_stream = self._get_heading_map(in_stream, fallback_out_file_name, out_path)
         else:
-            chapters_stream = in_stream
+            heading_map = {}
+            new_stream = in_stream
 
         toc = "# Table of Contents\n"
         self.stats.in_files += 1
-        chapters = split_by_heading(chapters_stream, self.level)
+        chapters = split_by_heading(new_stream, self.level)
         nav_chapter_path2title = {}
 
         for chapter in chapters:
             self.stats.chapters += 1
-            chapter_dir = out_path
-            for parent in chapter.parent_headings:
-                chapter_dir = chapter_dir / get_valid_filename(parent)
-            chapter_dir.mkdir(parents=True, exist_ok=True)
-
-            chapter_filename = (
-                fallback_out_file_name
-                if chapter.heading is None
-                else get_valid_filename(chapter.heading.heading_title) + ".md"
-            )
-            chapter_path = chapter_dir / chapter_filename
+            chapter_path = self._get_chapter_path(chapter, out_path, fallback_out_file_name)
+            chapter_path.parent.mkdir(parents=True, exist_ok=True)
 
             if self.verbose:
                 print(f"Write {len(chapter.text)} lines to '{chapter_path}'")
@@ -153,7 +140,6 @@ class Splitter(ABC):
                     indent = len(chapter.parent_headings) * "  "
                     toc += f"\n{indent}- [{title}](<./{chapter_path.relative_to(out_path)}>)"
             
-            # Write chapter content with optional transformations
             self._write_chapter_content(chapter, chapter_path, heading_map)
 
         if self.navigation:
@@ -185,44 +171,48 @@ class Splitter(ABC):
             return filename[:-3]
         return filename
 
-    def _collect_metadata(self, in_stream, fallback_out_file_name, out_path):
+    def _get_heading_map(self, in_stream, fallback_out_file_name, out_path):
         """
-        Pass 1: Collect all headings for anchor mapping.
-        Returns heading_map: {normalized_heading: (relative_path, anchor_id)}
+        Collect all headings for anchor mapping and return new stream for second pass
         """
-        heading_map = {}
-        
-        # First, we need to split the content to know where headings go
-        # But we can't consume the stream, so we'll read it into memory
+        # Two passes required: buffer content to allow for a second iteration later
         content = in_stream.read()
-        if isinstance(content, bytes):
-            content = content.decode(self.encoding or 'utf-8')
-        
-        # Split by lines and process
+
+        heading_map = {}
         lines = content.splitlines(keepends=True)
-        
-        # We'll simulate the splitting process to build heading map
         chapters = split_by_heading(lines, self.level)
-        
         for chapter in chapters:
-            if chapter.heading:
-                normalized = normalize_anchor(chapter.heading.heading_title)
-                # Calculate the chapter path
-                chapter_dir = out_path
-                for parent in chapter.parent_headings:
-                    chapter_dir = chapter_dir / get_valid_filename(parent)
-                
-                chapter_filename = get_valid_filename(chapter.heading.heading_title) + ".md"
-                chapter_path = chapter_dir / chapter_filename
-                relative_path = chapter_path.relative_to(out_path)
-                
-                # First occurrence wins for duplicates
-                if normalized not in heading_map:
-                    heading_map[normalized] = (relative_path, normalized)
+            if not chapter.heading:
+                continue
+
+            normalized = normalize_anchor(chapter.heading.heading_title)
+            chapter_path = self._get_chapter_path(chapter, out_path)
+            relative_path = chapter_path.relative_to(out_path)
+            
+            if normalized not in heading_map:
+                heading_map[normalized] = (relative_path, normalized)
+
+        if self.verbose:
+            print(f"Collected {len(heading_map)} heading anchors")
+
+        return heading_map, io.StringIO(content)
+
+    @staticmethod
+    def _get_chapter_path(chapter, out_path, fallback_filename=None):
+        """
+        Calculate the output path for a chapter.
+        """
+        chapter_dir = out_path
+        for parent in chapter.parent_headings:
+            chapter_dir = chapter_dir / get_valid_filename(parent)
         
-        # Rewind the stream by creating a new StringIO with the content
-        # We need to return both the heading_map and the content for re-processing
-        return heading_map, content
+        chapter_filename = (
+            fallback_filename
+            if chapter.heading is None
+            else get_valid_filename(chapter.heading.heading_title) + ".md"
+        )
+        
+        return chapter_dir / chapter_filename
 
     def _transform_line(self, line, heading_map, current_file):
         """
