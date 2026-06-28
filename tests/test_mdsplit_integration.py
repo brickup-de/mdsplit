@@ -7,7 +7,6 @@ def list_files(in_path):
     for dir_path, dirs, files in os.walk(in_path):
         for file_name in files:
             collected.add(str(Path(dir_path, file_name).relative_to(in_path)))
-    print(in_path, collected)
     return collected
 
 
@@ -23,10 +22,11 @@ def assert_same_file_contents(tmp_dir, expected_dir, encoding=None):
 
             actual_file = tmp_dir / expected_file.relative_to(expected_dir)
             actual = actual_file.read_text(encoding=encoding)
-            print("----")
-            print(actual)
-            print("----")
-            assert actual == expected, f"errror while comparing {expected_file}"
+            assert actual == expected, (
+                f"Content mismatch in {expected_file}\n"
+                f"Expected:\n{expected}\n"
+                f"Actual:\n{actual}"
+            )
 
 
 def test_fail_on_existing_output_directory(tmp_path, script_runner):
